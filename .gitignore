@@ -1,0 +1,9 @@
+# Training checkpoints
+checkpoints/
+checkpoint/
+checkpoint*/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
