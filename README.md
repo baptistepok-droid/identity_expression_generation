@@ -72,10 +72,3 @@ expression_identity_gen/
     losses.py
 ```
 
-## Trainable Blocks
-
-- custom Q/K/V LoRA layers in the backbone attention blocks
-- small `identity_scale` and `expression_scale` factors
-
-
-```
