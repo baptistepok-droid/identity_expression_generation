@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+from torch import nn
+
+from .expression_adapter import ExpressionAdapter
+
+
+@dataclass
+class ConditionBranchOutput:
+    tokens: torch.Tensor
+    identity_token_count: int
+    expression_token_count: int
+
+
+class DualConditionBuilder(nn.Module):
+    """Build [identity tokens ; expression tokens] for a DiT-like backbone.
+
+    The object expects a backbone module exposing:
+    - `patchify(latents) -> (tokens, grid)`
+    - `dim`
+    - `num_heads`
+    """
+
+    def __init__(
+        self,
+        dit,
+        expression_adapter: Optional[ExpressionAdapter] = None,
+        identity_scale: float = 1.0,
+        expression_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        object.__setattr__(self, "dit", dit)
+        self.expression_adapter = expression_adapter or ExpressionAdapter(
+            dim=dit.dim,
+        )
+        self.identity_type_embedding = nn.Parameter(torch.zeros(1, 1, dit.dim))
+        self.expression_type_embedding = nn.Parameter(torch.zeros(1, 1, dit.dim))
+        self.identity_scale = identity_scale
+        self.expression_scale = expression_scale
+
+    def forward(
+        self,
+        identity_latents: Optional[torch.Tensor] = None,
+        expression_latents: Optional[torch.Tensor] = None,
+        expression_face_boxes: Optional[torch.Tensor] = None,
+    ) -> Optional[ConditionBranchOutput]:
+        pieces = []
+        identity_count = 0
+        expression_count = 0
+
+        if identity_latents is not None:
+            identity_tokens, _ = self.dit.patchify(identity_latents)
+            identity_tokens = identity_tokens + self.identity_type_embedding.to(
+                dtype=identity_tokens.dtype,
+                device=identity_tokens.device,
+            )
+            identity_tokens = identity_tokens * self.identity_scale
+            pieces.append(identity_tokens)
+            identity_count = identity_tokens.shape[1]
+
+        if expression_latents is not None:
+            expression_vae_tokens, expression_grid = self.dit.patchify(expression_latents)
+            expression_tokens = self.expression_adapter(
+                expression_vae_tokens,
+                grid=expression_grid,
+                face_boxes=expression_face_boxes,
+            )
+            expression_tokens = expression_tokens + self.expression_type_embedding.to(
+                dtype=expression_tokens.dtype,
+                device=expression_tokens.device,
+            )
+            expression_tokens = expression_tokens * self.expression_scale
+            pieces.append(expression_tokens)
+            expression_count = expression_tokens.shape[1]
+
+        if not pieces:
+            return None
+
+        return ConditionBranchOutput(
+            tokens=torch.cat(pieces, dim=1),
+            identity_token_count=identity_count,
+            expression_token_count=expression_count,
+        )

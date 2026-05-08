@@ -1,0 +1,36 @@
+base_model:
+  name: Wan2.1-T2V-14B
+  path: checkpoints/Wan2.1/t2v
+  freeze: true
+
+attention_adapter:
+  type: restricted_self_attention_lora
+  train_lora_qkv: true
+
+expression_adapter:
+  type: face_token_selector
+  max_expression_tokens: 512
+  fallback_face_box: [0.25, 0.12, 0.75, 0.82]
+
+data:
+  dataset: MEAD
+  num_expression_frames: 8
+  frame_selection: topk_emotion_score
+  height: 480
+  width: 832
+  num_frames: 81
+
+training:
+  batch_size: 1
+  learning_rate: 1.0e-4
+  trainable:
+    - expression_adapter
+    - attention_lora_qkv
+  frozen:
+    - wan_vae
+    - wan_text_encoder
+    - wan_dit_base
+  condition_dropout:
+    identity: 0.10
+    expression: 0.10
+    both: 0.05
