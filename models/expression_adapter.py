@@ -5,20 +5,20 @@ from torch import nn
 
 
 class ExpressionAdapter(nn.Module):
-    """Select face-region tokens from expression-video VAE tokens.
+    """Select expression-video tokens for the condition branch.
 
     Input must already be tokenized from the expression video:
 
         expression video -> VAE latents -> DiT patchify -> expression_vae_tokens
 
     The adapter receives `expression_vae_tokens` with shape `[B, N, D]` and the
-    patch grid `(F, H, W)`. It keeps the tokens that spatially correspond to the
-    face area so they can be injected into the diffusion backbone condition
-    branch.
+    patch grid `(F, H, W)`. If face boxes are provided, it keeps the tokens that
+    spatially correspond to the face area. If no boxes are provided, it keeps all
+    expression-video tokens.
 
     `face_boxes` are normalized boxes in image/latent coordinates:
     `[x1, y1, x2, y2]` in `[0, 1]`, with shape `[B, F, 4]` or `[B, 4]`.
-    If no box is provided, a centered face prior is used.
+    If no box is provided, all expression-video tokens are used.
     """
 
     def __init__(
@@ -38,7 +38,10 @@ class ExpressionAdapter(nn.Module):
         grid: tuple[int, int, int],
         face_boxes: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return selected expression face tokens with shape `[B, K, D]`."""
+        """Return selected expression tokens with shape `[B, K, D]`."""
+
+        if face_boxes is None:
+            return expression_vae_tokens
 
         selected_ids = self.face_token_indices(
             batch_size=expression_vae_tokens.shape[0],

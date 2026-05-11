@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-""""""
+"""
+TOKENIZERS_PARALLELISM=false accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 --dynamo_backend no train.py --dataset_base_path /home/ens.old/Bpokrzywa/datasets/dataset/MEAD --dataset_metadata_path datasets/mead_identity_smoke.csv --wan_model_path checkpoints/Wan2.1/t2v --height 128 --width 128 --num_frames 17 --max_steps 500 --save_every 50 --batch_size 1 --target_effective_batch_size 4 --gradient_accumulation_steps 1 --rank 4 --dtype bf16 --gradient_checkpointing --gradient_checkpointing_offload --vram_buffer 8  | tee train_logs/run.log
+"""
 
 from __future__ import annotations
 
@@ -359,6 +361,9 @@ class WanConditionLoRATrainingModule(nn.Module):
         if identity_latents is not None or expression_latents is not None:
             condition_builder = self.pipe.get_condition_builder(self.pipe.dit)
             condition_builder.requires_grad_(False)
+            condition = condition_builder(identity_latents, expression_latents, expression_face_boxes)
+            print("expression tokens:", condition.expression_token_count)
+
         else:
             raise ValueError(
                 "Stand-In condition LoRA training requires identity_image or expression_video "
