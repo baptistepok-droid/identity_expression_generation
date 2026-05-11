@@ -155,13 +155,13 @@ class WanSelfAttention(nn.Module):
         self.cond_size = None
         self.cond_group_sizes = None
 
-    def init_lora(self, train=False, device=None, dtype=None):
+    def init_lora(self, train=False, device=None, dtype=None, rank=128):
         dim = self.dim
         device = device or self.q.weight.device
         dtype = dtype or self.q.weight.dtype
-        self.q_loras = LoRALinearLayer(dim, dim, rank=128, device=device, dtype=dtype)
-        self.k_loras = LoRALinearLayer(dim, dim, rank=128, device=device, dtype=dtype)
-        self.v_loras = LoRALinearLayer(dim, dim, rank=128, device=device, dtype=dtype)
+        self.q_loras = LoRALinearLayer(dim, dim, rank=rank, device=device, dtype=dtype)
+        self.k_loras = LoRALinearLayer(dim, dim, rank=rank, device=device, dtype=dtype)
+        self.v_loras = LoRALinearLayer(dim, dim, rank=rank, device=device, dtype=dtype)
 
         for lora in [self.q_loras, self.k_loras, self.v_loras]:
             for param in lora.parameters():

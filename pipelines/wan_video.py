@@ -1673,15 +1673,15 @@ def model_fn_wan_video(
                 with torch.autograd.graph.save_on_cpu():
                     x, x_ip = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                        x,
-                        context,
-                        t_mod,
-                        freqs,
-                        x_ip=x_ip,
-                        t_mod_ip=t_mod_ip,
-                        condition_token_counts=condition_token_counts,
-                        use_reentrant=False,
-                    )
+                    x,
+                    context,
+                    t_mod,
+                    freqs,
+                    x_ip,
+                    t_mod_ip,
+                    condition_token_counts,
+                    use_reentrant=False,
+                )
             elif use_gradient_checkpointing:
                 x, x_ip = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
@@ -1689,9 +1689,9 @@ def model_fn_wan_video(
                     context,
                     t_mod,
                     freqs,
-                    x_ip=x_ip,
-                    t_mod_ip=t_mod_ip,
-                    condition_token_counts=condition_token_counts,
+                    x_ip,
+                    t_mod_ip,
+                    condition_token_counts,
                     use_reentrant=False,
                 )
             else:

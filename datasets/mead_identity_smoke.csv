@@ -1,0 +1,9 @@
+video,prompt,identity_image
+M037/front/neutral/level_1/001.mp4,a person with a neutral facial expression,/home/ens.old/Bpokrzywa/datasets/mead_neutral_first_frames/M037_neutral_frame.png
+M037/front/happy/level_3/001.mp4,a person smiling with a happy facial expression,/home/ens.old/Bpokrzywa/datasets/mead_neutral_first_frames/M037_neutral_frame.png
+M037/front/angry/level_3/001.mp4,a person showing an angry facial expression,/home/ens.old/Bpokrzywa/datasets/mead_neutral_first_frames/M037_neutral_frame.png
+M037/front/sad/level_3/001.mp4,a person showing a sad facial expression,/home/ens.old/Bpokrzywa/datasets/mead_neutral_first_frames/M037_neutral_frame.png
+M037/front/fear/level_3/001.mp4,a person showing a fearful facial expression,/home/ens.old/Bpokrzywa/datasets/mead_neutral_first_frames/M037_neutral_frame.png
+M037/front/disgusted/level_3/001.mp4,a person showing a disgusted facial expression,/home/ens.old/Bpokrzywa/datasets/mead_neutral_first_frames/M037_neutral_frame.png
+M037/front/contempt/level_3/001.mp4,a person showing a contempt facial expression,/home/ens.old/Bpokrzywa/datasets/mead_neutral_first_frames/M037_neutral_frame.png
+M037/front/surprised/level_3/001.mp4,a person showing a surprised facial expression,/home/ens.old/Bpokrzywa/datasets/mead_neutral_first_frames/M037_neutral_frame.png
