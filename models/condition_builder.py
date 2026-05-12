@@ -37,8 +37,6 @@ class DualConditionBuilder(nn.Module):
         self.expression_adapter = expression_adapter or ExpressionAdapter(
             dim=dit.dim,
         )
-        self.identity_type_embedding = nn.Parameter(torch.zeros(1, 1, dit.dim))
-        self.expression_type_embedding = nn.Parameter(torch.zeros(1, 1, dit.dim))
         self.identity_scale = identity_scale
         self.expression_scale = expression_scale
 
@@ -54,10 +52,6 @@ class DualConditionBuilder(nn.Module):
 
         if identity_latents is not None:
             identity_tokens, _ = self.dit.patchify(identity_latents)
-            identity_tokens = identity_tokens + self.identity_type_embedding.to(
-                dtype=identity_tokens.dtype,
-                device=identity_tokens.device,
-            )
             identity_tokens = identity_tokens * self.identity_scale
             pieces.append(identity_tokens)
             identity_count = identity_tokens.shape[1]
@@ -68,10 +62,6 @@ class DualConditionBuilder(nn.Module):
                 expression_vae_tokens,
                 grid=expression_grid,
                 face_boxes=expression_face_boxes,
-            )
-            expression_tokens = expression_tokens + self.expression_type_embedding.to(
-                dtype=expression_tokens.dtype,
-                device=expression_tokens.device,
             )
             expression_tokens = expression_tokens * self.expression_scale
             pieces.append(expression_tokens)

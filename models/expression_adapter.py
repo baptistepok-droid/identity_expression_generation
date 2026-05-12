@@ -24,7 +24,7 @@ class ExpressionAdapter(nn.Module):
     def __init__(
         self,
         dim: int,
-        max_expression_tokens: int = 512,
+        max_expression_tokens: int = 8192,
         fallback_face_box: tuple[float, float, float, float] = (0.25, 0.12, 0.75, 0.82),
     ) -> None:
         super().__init__()
@@ -110,20 +110,38 @@ class ExpressionAdapter(nn.Module):
 
         face_boxes = face_boxes.to(device=device, dtype=torch.float32)
         if face_boxes.dim() == 2:
-            face_boxes = face_boxes[:, None, :].expand(batch_size, frames, 4)
+            if face_boxes.shape[0] == batch_size:
+                face_boxes = face_boxes[:, None, :]
+            else:
+                face_boxes = face_boxes[None, :, :]
+        if face_boxes.dim() != 3 or face_boxes.shape[-1] != 4:
+            raise ValueError(f"face_boxes must have shape [B, F, 4], [F, 4], or [B, 4], got {tuple(face_boxes.shape)}")
+
+        if face_boxes.shape[0] == 1 and batch_size > 1:
+            face_boxes = face_boxes.expand(batch_size, -1, -1)
+        elif face_boxes.shape[0] != batch_size:
+            raise ValueError(f"face_boxes batch size {face_boxes.shape[0]} does not match {batch_size}")
+
         if face_boxes.shape[1] == 1:
             face_boxes = face_boxes.expand(batch_size, frames, 4)
+        elif face_boxes.shape[1] != frames:
+            frame_ids = torch.linspace(
+                0,
+                face_boxes.shape[1] - 1,
+                steps=frames,
+                device=device,
+            ).round().long()
+            face_boxes = face_boxes.index_select(dim=1, index=frame_ids)
         return face_boxes.clamp(0.0, 1.0)
 
     def _fit_token_count(self, indices: torch.Tensor) -> torch.Tensor:
-        if indices.numel() >= self.max_expression_tokens:
-            positions = torch.linspace(
-                0,
-                indices.numel() - 1,
-                steps=self.max_expression_tokens,
-                device=indices.device,
-            ).long()
-            return indices[positions]
+        if indices.numel() <= self.max_expression_tokens:
+            return indices
 
-        repeat = (self.max_expression_tokens + indices.numel() - 1) // indices.numel()
-        return indices.repeat(repeat)[: self.max_expression_tokens]
+        positions = torch.linspace(
+            0,
+            indices.numel() - 1,
+            steps=self.max_expression_tokens,
+            device=indices.device,
+        ).long()
+        return indices[positions]

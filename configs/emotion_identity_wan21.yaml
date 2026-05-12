@@ -9,7 +9,7 @@ attention_adapter:
 
 expression_adapter:
   type: face_token_selector
-  max_expression_tokens: 512
+  max_expression_tokens: 8192
   fallback_face_box: [0.25, 0.12, 0.75, 0.82]
 
 data:

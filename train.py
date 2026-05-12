@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TOKENIZERS_PARALLELISM=false accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 --dynamo_backend no train.py --dataset_base_path /home/ens.old/Bpokrzywa/datasets/dataset/MEAD --dataset_metadata_path datasets/mead_identity_smoke.csv --wan_model_path checkpoints/Wan2.1/t2v --height 128 --width 128 --num_frames 17 --max_steps 500 --save_every 50 --batch_size 1 --target_effective_batch_size 4 --gradient_accumulation_steps 1 --rank 4 --dtype bf16 --gradient_checkpointing --gradient_checkpointing_offload --vram_buffer 8  | tee train_logs/run.log
+TOKENIZERS_PARALLELISM=false accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 --dynamo_backend no train.py --dataset_base_path /home/ens.old/Bpokrzywa/datasets/dataset/MEAD --dataset_metadata_path datasets/mead_identity_smoke.csv --wan_model_path checkpoints/Wan2.1/t2v --num_frames 81 --max_steps 500 --save_every 50 --batch_size 1 --target_effective_batch_size 4 --gradient_accumulation_steps 1 --rank 4 --dtype bf16 --gradient_checkpointing --gradient_checkpointing_offload --vram_buffer 8  | tee train_logs/run.log
 """
 
 from __future__ import annotations
@@ -30,9 +30,7 @@ WAN_CODE_ROOT = REPO_ROOT / "expression_identity_gen"
 if str(WAN_CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(WAN_CODE_ROOT))
 
-from pipelines.wan_video import ModelConfig, WanVideoPipeline  # noqa: E402
-
-
+from pipelines.wan_video import ModelConfig, WanVideoPipeline 
 CONDITION_LORA_NAMES = ("q_loras", "k_loras", "v_loras")
 
 
@@ -361,8 +359,6 @@ class WanConditionLoRATrainingModule(nn.Module):
         if identity_latents is not None or expression_latents is not None:
             condition_builder = self.pipe.get_condition_builder(self.pipe.dit)
             condition_builder.requires_grad_(False)
-            condition = condition_builder(identity_latents, expression_latents, expression_face_boxes)
-            print("expression tokens:", condition.expression_token_count)
 
         else:
             raise ValueError(
@@ -584,7 +580,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--max_pixels", type=int, default=1280 * 720)
     parser.add_argument("--num_frames", type=int, default=81)
-    parser.add_argument("--expression_frames", type=int, default=8)
+    parser.add_argument("--expression_frames", type=int, default=65)
     parser.add_argument("--dataset_repeat", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size per process/GPU.")
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
