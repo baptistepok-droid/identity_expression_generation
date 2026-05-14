@@ -69,12 +69,15 @@ def flash_attention(
 
 
 def rope_apply(x, freqs, num_heads):
+    dtype = x.dtype
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    compute_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
     x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
+        x.to(compute_dtype).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
     )
+    freqs = freqs.to(device=x.device, dtype=x_out.dtype)
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
+    return x_out.to(dtype)
 
 
 class RMSNorm(nn.Module):

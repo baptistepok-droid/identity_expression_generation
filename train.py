@@ -12,8 +12,11 @@ import math
 import os
 import random
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import imageio
 import torch
@@ -53,9 +56,25 @@ def is_main(accelerator) -> bool:
     return accelerator is None or accelerator.is_main_process
 
 
+def unwrap_fsdp_module(module: nn.Module) -> nn.Module:
+    return getattr(module, "_fsdp_wrapped_module", module)
+
+
+@contextmanager
+def summon_full_params_if_fsdp(module: nn.Module, writeback: bool = False):
+    if hasattr(module, "_fsdp_wrapped_module"):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        with FSDP.summon_full_params(module, writeback=writeback, recurse=False):
+            yield
+    else:
+        yield
+
+
 def init_condition_loras(dit: nn.Module, train: bool, rank: int) -> list[str]:
     initialized = []
     for block_idx, block in enumerate(dit.blocks):
+        block = unwrap_fsdp_module(block)
         attn = block.self_attn
         attn.init_lora(train=train, rank=rank)
         for name in CONDITION_LORA_NAMES:
@@ -68,6 +87,7 @@ def init_condition_loras(dit: nn.Module, train: bool, rank: int) -> list[str]:
 def condition_lora_parameters(dit: nn.Module) -> list[nn.Parameter]:
     params = []
     for block in dit.blocks:
+        block = unwrap_fsdp_module(block)
         attn = block.self_attn
         for name in CONDITION_LORA_NAMES:
             if not hasattr(attn, name):
@@ -78,15 +98,48 @@ def condition_lora_parameters(dit: nn.Module) -> list[nn.Parameter]:
 
 def export_condition_lora_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
     state = {}
+    if hasattr(module, "blocks"):
+        for block_idx, block in enumerate(module.blocks):
+            with summon_full_params_if_fsdp(block):
+                block = unwrap_fsdp_module(block)
+                attn = block.self_attn
+                for lora_name in CONDITION_LORA_NAMES:
+                    if not hasattr(attn, lora_name):
+                        continue
+                    submodule = getattr(attn, lora_name)
+                    prefix = f"blocks.{block_idx}.self_attn.{lora_name}"
+                    state[f"{prefix}.down.weight"] = submodule.down.weight.detach().cpu()
+                    state[f"{prefix}.up.weight"] = submodule.up.weight.detach().cpu()
+        return state
     for name, submodule in module.named_modules():
-        if name.rsplit(".", 1)[-1] not in CONDITION_LORA_NAMES:
-            continue
-        state[f"{name}.down.weight"] = submodule.down.weight.detach().cpu()
-        state[f"{name}.up.weight"] = submodule.up.weight.detach().cpu()
+        if name.rsplit(".", 1)[-1] in CONDITION_LORA_NAMES:
+            state[f"{name}.down.weight"] = submodule.down.weight.detach().cpu()
+            state[f"{name}.up.weight"] = submodule.up.weight.detach().cpu()
     return state
 
 
 def load_condition_lora_state_dict(module: nn.Module, state: dict[str, torch.Tensor]) -> None:
+    if hasattr(module, "blocks"):
+        missing = []
+        for name, value in state.items():
+            parts = name.split(".")
+            if len(parts) != 6 or parts[0] != "blocks" or parts[2] != "self_attn":
+                missing.append(name)
+                continue
+            block_idx = int(parts[1])
+            lora_name = parts[3]
+            weight_name = parts[4]
+            block = module.blocks[block_idx]
+            with summon_full_params_if_fsdp(block, writeback=True):
+                block = unwrap_fsdp_module(block)
+                if not hasattr(block.self_attn, lora_name):
+                    missing.append(name)
+                    continue
+                target = getattr(getattr(block.self_attn, lora_name), weight_name).weight
+                target.data.copy_(value.to(device=target.device, dtype=target.dtype))
+        if missing:
+            raise KeyError(f"Unexpected condition LoRA keys in checkpoint: {missing[:8]}")
+        return
     model_state = module.state_dict()
     missing = []
     for name, value in state.items():
@@ -286,7 +339,7 @@ def load_wan_pipe(args: argparse.Namespace, dtype: torch.dtype, device: torch.de
         ),
     )
     pipe.scheduler.set_timesteps(args.num_train_timesteps, training=True)
-    if args.enable_vram_management:
+    if args.enable_vram_management and not args.fsdp_shard_dit:
         pipe.enable_vram_management(
             num_persistent_param_in_dit=args.num_persistent_param_in_dit,
             vram_limit=args.vram_limit,
@@ -304,6 +357,7 @@ class WanConditionLoRATrainingModule(nn.Module):
         self.pipe.text_encoder.requires_grad_(False)
         self.pipe.vae.requires_grad_(False)
         self.condition_loras = init_condition_loras(self.pipe.dit, train=True, rank=args.rank)
+        self.condition_lora_param_count = sum(param.numel() for param in condition_lora_parameters(self.pipe.dit))
         self.pipe.dit.train()
         self.pipe.text_encoder.eval()
         self.pipe.vae.eval()
@@ -315,7 +369,8 @@ class WanConditionLoRATrainingModule(nn.Module):
         losses = []
         for item in samples:
             inputs = self.forward_preprocess(item)
-            self.pipe.load_models_to_device(["dit"])
+            if not self.args.fsdp_shard_dit:
+                self.pipe.load_models_to_device(["dit"])
             losses.append(
                 self.pipe.training_loss(
                     **inputs,
@@ -328,7 +383,11 @@ class WanConditionLoRATrainingModule(nn.Module):
     def forward_preprocess(self, sample: TrainSample) -> dict:
         height, width = sample.video[0].height, sample.video[0].width
         with torch.no_grad():
-            self.pipe.load_models_to_device(["text_encoder", "vae"])
+            if self.args.fsdp_shard_dit:
+                self.pipe.text_encoder.to(self.pipe.device)
+                self.pipe.vae.to(self.pipe.device)
+            else:
+                self.pipe.load_models_to_device(["text_encoder", "vae"])
             context = self.pipe.prompter.encode_prompt(
                 sample.prompt,
                 positive=True,
@@ -354,6 +413,10 @@ class WanConditionLoRATrainingModule(nn.Module):
                 expression_latents = self.pipe.encode_condition_frames(sample.expression_video, height, width)
                 if self.args.detect_expression_boxes:
                     expression_face_boxes = self.pipe.detect_expression_face_boxes(sample.expression_video)
+            if self.args.fsdp_shard_dit:
+                self.pipe.text_encoder.cpu()
+                self.pipe.vae.cpu()
+                torch.cuda.empty_cache()
 
         condition_builder = None
         if identity_latents is not None or expression_latents is not None:
@@ -458,6 +521,189 @@ def build_lr_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def move_parameters_to_device(params: list[nn.Parameter], device: torch.device, dtype: torch.dtype) -> None:
+    for param in params:
+        param.data = param.data.to(device=device, dtype=dtype)
+        if param.grad is not None:
+            param.grad = param.grad.to(device=device, dtype=dtype)
+
+
+def move_attention_norms_to_device(pipe: WanVideoPipeline, device: torch.device, dtype: torch.dtype) -> None:
+    for dit in (getattr(pipe, "dit", None), getattr(pipe, "dit2", None)):
+        if dit is None:
+            continue
+        for block in getattr(dit, "blocks", []):
+            block = unwrap_fsdp_module(block)
+            attn = getattr(block, "self_attn", None)
+            if attn is None:
+                continue
+            for name in ("norm_q", "norm_k"):
+                module = getattr(attn, name, None)
+                if module is not None:
+                    module.to(device=device, dtype=dtype)
+
+
+def enable_fsdp_for_dit(
+    pipe: WanVideoPipeline,
+    accelerator: Accelerator,
+    dtype: torch.dtype,
+    cpu_offload: bool,
+    wrap_policy: str,
+) -> None:
+    if not accelerator.distributed_type.name.upper().endswith("MULTI_GPU") and accelerator.num_processes <= 1:
+        raise RuntimeError("--fsdp_shard_dit requires a multi-GPU distributed launch.")
+    try:
+        from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy
+    except ImportError as exc:
+        raise RuntimeError("This PyTorch build does not provide FSDP.") from exc
+
+    mixed_precision = MixedPrecision(
+        param_dtype=dtype,
+        reduce_dtype=dtype,
+        buffer_dtype=dtype,
+    )
+    offload = CPUOffload(offload_params=True) if cpu_offload else None
+
+    def wrap(module: nn.Module) -> FSDP:
+        return FSDP(
+            module,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            mixed_precision=mixed_precision,
+            cpu_offload=offload,
+            device_id=accelerator.device,
+            use_orig_params=True,
+            limit_all_gathers=True,
+        )
+
+    if wrap_policy == "block":
+        for name in ("patch_embedding", "text_embedding", "time_embedding", "time_projection", "head"):
+            module = getattr(pipe.dit, name, None)
+            if module is not None:
+                module.to(device=accelerator.device, dtype=dtype)
+        for index, block in enumerate(pipe.dit.blocks):
+            pipe.dit.blocks[index] = wrap(block)
+        return
+
+    if wrap_policy != "linear":
+        raise ValueError(f"Unsupported FSDP wrap policy: {wrap_policy}")
+
+    def wrap_linear_children(module: nn.Module) -> None:
+        for name, child in list(module.named_children()):
+            if isinstance(child, FSDP):
+                continue
+            if isinstance(child, nn.Linear):
+                setattr(module, name, wrap(child))
+            else:
+                wrap_linear_children(child)
+
+    def move_unwrapped_tensors(module: nn.Module) -> None:
+        if isinstance(module, FSDP):
+            return
+        for param in module.parameters(recurse=False):
+            param.data = param.data.to(device=accelerator.device, dtype=dtype)
+            if param.grad is not None:
+                param.grad = param.grad.to(device=accelerator.device, dtype=dtype)
+        for buffer_name, buffer in module.named_buffers(recurse=False):
+            setattr(module, buffer_name, buffer.to(device=accelerator.device))
+        for child in module.children():
+            move_unwrapped_tensors(child)
+
+    wrap_linear_children(pipe.dit)
+    move_unwrapped_tensors(pipe.dit)
+
+
+def sync_gradients(params: list[nn.Parameter], accelerator: Accelerator) -> None:
+    if accelerator.num_processes <= 1:
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    for param in params:
+        if param.grad is None:
+            continue
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        param.grad.div_(accelerator.num_processes)
+
+
+def broadcast_parameters(params: list[nn.Parameter], accelerator: Accelerator) -> None:
+    if accelerator.num_processes <= 1:
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    for param in params:
+        dist.broadcast(param.data, src=0)
+
+
+def print_cuda_memory(tag: str, accelerator: Accelerator) -> None:
+    if not torch.cuda.is_available() or not accelerator.is_local_main_process:
+        return
+    device = accelerator.device
+    torch.cuda.synchronize(device)
+    free, total = torch.cuda.mem_get_info(device)
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    max_allocated = torch.cuda.max_memory_allocated(device)
+    print(
+        f"[cuda-mem][rank {accelerator.process_index}] {tag}: "
+        f"allocated={allocated / 1024**3:.2f}GB "
+        f"reserved={reserved / 1024**3:.2f}GB "
+        f"max_allocated={max_allocated / 1024**3:.2f}GB "
+        f"free={free / 1024**3:.2f}GB "
+        f"total={total / 1024**3:.2f}GB",
+        flush=True,
+    )
+
+
+def cuda_memory_profile_enabled() -> bool:
+    return os.environ.get("WAN_MEMORY_PROFILE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def start_cuda_memory_history(accelerator: Accelerator) -> None:
+    if not cuda_memory_profile_enabled() or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.memory._record_memory_history(
+            enabled="all",
+            stacks="all",
+            max_entries=100000,
+        )
+        if accelerator.is_local_main_process:
+            print("[cuda-mem] recording CUDA memory history", flush=True)
+    except TypeError:
+        torch.cuda.memory._record_memory_history(enabled=True)
+    except Exception as exc:
+        if accelerator.is_local_main_process:
+            print(f"[cuda-mem] memory history unavailable: {exc}", flush=True)
+
+
+def dump_cuda_oom_debug(output_dir: Path, accelerator: Accelerator, tag: str) -> None:
+    if not torch.cuda.is_available():
+        return
+    rank = accelerator.process_index
+    snapshot_dir = output_dir / "memory_snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshot_dir / f"{tag}_rank{rank}.pickle"
+    summary_path = snapshot_dir / f"{tag}_rank{rank}.txt"
+    try:
+        torch.cuda.synchronize(accelerator.device)
+    except Exception:
+        pass
+    try:
+        summary_path.write_text(torch.cuda.memory_summary(accelerator.device, abbreviated=False))
+        print(f"[cuda-mem][rank {rank}] wrote memory summary: {summary_path}", flush=True)
+    except Exception as exc:
+        print(f"[cuda-mem][rank {rank}] failed to write memory summary: {exc}", flush=True)
+    if cuda_memory_profile_enabled():
+        try:
+            torch.cuda.memory._dump_snapshot(str(snapshot_path))
+            print(f"[cuda-mem][rank {rank}] wrote memory snapshot: {snapshot_path}", flush=True)
+        except Exception as exc:
+            print(f"[cuda-mem][rank {rank}] failed to write memory snapshot: {exc}", flush=True)
+
+
 def train(args: argparse.Namespace) -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     grad_accum = args.gradient_accumulation_steps
@@ -493,9 +739,23 @@ def train(args: argparse.Namespace) -> None:
 
     pipe = load_wan_pipe(args, dtype=dtype, device=accelerator.device)
     model = WanConditionLoRATrainingModule(pipe, args)
+    if args.fsdp_shard_dit:
+        enable_fsdp_for_dit(
+            pipe,
+            accelerator,
+            dtype=dtype,
+            cpu_offload=args.fsdp_cpu_offload,
+            wrap_policy=args.fsdp_wrap_policy,
+        )
+    print_cuda_memory("after model load", accelerator)
     params = model.trainable_parameters()
     if not params:
         raise RuntimeError("No trainable Stand-In condition LoRA parameters found.")
+    if not args.fsdp_shard_dit or args.fsdp_wrap_policy == "linear":
+        move_parameters_to_device(params, accelerator.device, dtype)
+        move_attention_norms_to_device(pipe, accelerator.device, dtype)
+        broadcast_parameters(params, accelerator)
+    print_cuda_memory("after LoRA/support move to GPU", accelerator)
     optimizer = torch.optim.AdamW(
         params,
         lr=args.learning_rate,
@@ -503,24 +763,25 @@ def train(args: argparse.Namespace) -> None:
         eps=args.adam_epsilon,
         weight_decay=args.weight_decay,
     )
+    print_cuda_memory("after optimizer init", accelerator)
     lr_scheduler = build_lr_scheduler(optimizer, args.lr_warmup_steps, args.max_steps)
 
     if accelerator.is_main_process:
         print(f"Initialized {len(model.condition_loras)} Stand-In condition LoRA modules.")
         print("Example targets:", ", ".join(model.condition_loras[:6]))
-        print(f"Trainable condition LoRA parameters: {sum(param.numel() for param in params):,}")
+        print(f"Trainable condition LoRA parameters: {model.condition_lora_param_count:,}")
         print(f"World size: {accelerator.num_processes}")
         print(f"Gradient accumulation: {grad_accum}")
         print(f"Batch size per process: {args.batch_size}")
         print(f"Effective batch size: {accelerator.num_processes * args.batch_size * grad_accum}")
 
-    model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        model,
-        optimizer,
-        dataloader,
-        lr_scheduler,
-    )
+    dataloader = accelerator.prepare(dataloader)
+    print_cuda_memory("after dataloader prepare", accelerator)
     global_step = load_training_state(args.resume_from_checkpoint, model, optimizer, lr_scheduler, accelerator)
+    if not args.fsdp_shard_dit or args.fsdp_wrap_policy == "linear":
+        broadcast_parameters(params, accelerator)
+    print_cuda_memory("after checkpoint load", accelerator)
+    start_cuda_memory_history(accelerator)
 
     progress = tqdm(
         total=args.max_steps,
@@ -531,22 +792,47 @@ def train(args: argparse.Namespace) -> None:
         mininterval=0.5,
         file=sys.stdout,
     )
+    accumulation_step = 0
     while global_step < args.max_steps:
         for sample in dataloader:
-            with accelerator.accumulate(model):
+            profile_memory = global_step == 0 and accelerator.is_local_main_process
+            if accumulation_step == 0:
                 optimizer.zero_grad(set_to_none=True)
+            if profile_memory:
+                torch.cuda.reset_peak_memory_stats(accelerator.device)
+                print_cuda_memory("step0 before forward", accelerator)
+            try:
                 loss = model(sample)
-                accelerator.backward(loss)
+            except torch.OutOfMemoryError:
+                dump_cuda_oom_debug(output_dir, accelerator, "oom_forward")
+                raise
+            loss_for_log = loss.detach()
+            if profile_memory:
+                print_cuda_memory("step0 after forward", accelerator)
+                torch.cuda.empty_cache()
+                print_cuda_memory("step0 after forward empty_cache", accelerator)
+            accelerator.backward(loss / grad_accum)
+            if profile_memory:
+                print_cuda_memory("step0 after backward", accelerator)
+            accumulation_step += 1
+            if accumulation_step >= grad_accum:
+                if (
+                    not args.fsdp_shard_dit
+                    or (args.fsdp_wrap_policy == "linear" and not args.fsdp_cpu_offload)
+                ):
+                    sync_gradients(params, accelerator)
                 if accelerator.sync_gradients and args.max_grad_norm > 0:
-                    accelerator.clip_grad_norm_(accelerator.unwrap_model(model).trainable_parameters(), args.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
+                accumulation_step = 0
+                if profile_memory:
+                    print_cuda_memory("step0 after optimizer step", accelerator)
 
-            if accelerator.sync_gradients:
                 global_step += 1
                 progress.update(1)
                 progress.set_postfix(
-                    loss=f"{accelerator.gather(loss.detach()).mean().item():.5f}",
+                    loss=f"{accelerator.gather(loss_for_log).mean().item():.5f}",
                     lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
                 )
                 progress.refresh()
@@ -610,6 +896,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detect_expression_boxes", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--gradient_checkpointing_offload", action="store_true")
+    parser.add_argument("--fsdp_shard_dit", action="store_true", help="Experimentally shard Wan DiT blocks with PyTorch FSDP.")
+    parser.add_argument("--fsdp_wrap_policy", default="linear", choices=("linear", "block"), help="FSDP wrapping granularity for the Wan DiT.")
+    parser.add_argument("--fsdp_cpu_offload", action="store_true", help="Use FSDP CPU parameter offload. Usually slower; prefer leaving this off.")
     parser.add_argument("--enable_vram_management", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num_persistent_param_in_dit", type=int, default=None)
     parser.add_argument("--vram_limit", type=float, default=None)
