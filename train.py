@@ -1,6 +1,26 @@
 #!/usr/bin/env python3
 """
-TOKENIZERS_PARALLELISM=false accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 --dynamo_backend no train.py --dataset_base_path /home/ens.old/Bpokrzywa/datasets/dataset/MEAD --dataset_metadata_path datasets/mead_identity_smoke.csv --wan_model_path checkpoints/Wan2.1/t2v --num_frames 81 --max_steps 500 --save_every 50 --batch_size 1 --target_effective_batch_size 4 --gradient_accumulation_steps 1 --rank 4 --dtype bf16 --gradient_checkpointing --gradient_checkpointing_offload --vram_buffer 8  | tee train_logs/run.log
+TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node=4 train.py \
+  --dataset_base_path /home/ens.old/Bpokrzywa/datasets/dataset/MEAD \
+  --dataset_metadata_path datasets/mead_identity_smoke.csv \
+  --wan_model_path checkpoints/Wan2.1/t2v \
+  --num_frames 81 \
+  --max_steps 500 \
+  --save_every 50 \
+  --batch_size 1 \
+  --target_effective_batch_size 16\
+  --rank 128 \
+  --dtype bf16 \
+  --mixed_precision bf16 \
+  --gradient_checkpointing \
+  --gradient_checkpointing_offload \
+  --vram_buffer 8 \
+  --fsdp_shard_dit \
+  --fsdp_wrap_policy linear \
+  --fsdp_cpu_offload \
+  --output_dir train_logs/fsdp_rank128_cpu_offload \
+  2>&1 | tee train_logs/fsdp_rank128_cpu_offload.log
+
 """
 
 from __future__ import annotations
