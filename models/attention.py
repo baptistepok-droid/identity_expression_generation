@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from einops import rearrange
 from typing import Optional
+
 
 try:
     import flash_attn_interface
@@ -181,6 +183,59 @@ class WanSelfAttention(nn.Module):
         k = rope_apply(k, freqs, self.num_heads)
         x = self.attn(q, k, v)
         return self.o(x)
+    
+
+    def _store_condition_winner_attention(
+        self,
+        q_main,
+        k_cond,
+        identity_count,
+        expression_count,
+        chunk_size,
+    ):
+        if identity_count <= 0 and expression_count <= 0:
+            return
+
+        q = rearrange(q_main.float(), "b s (n d) -> b n s d", n=self.num_heads)
+        k_cond = rearrange(
+            k_cond[:, : identity_count + expression_count].float(),
+            "b s (n d) -> b n s d",
+            n=self.num_heads,
+        )
+
+        heat_chunks = []
+        group_chunks = []
+        token_chunks = []
+        for start in range(0, q.shape[2], chunk_size):
+            q_chunk = q[:, :, start : start + chunk_size]
+            scores = torch.matmul(q_chunk, k_cond.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            probs = scores.softmax(dim=-1)
+            mean_probs = probs.mean(dim=1)
+            top_prob, top_token = mean_probs.max(dim=-1)
+            top_group = (top_token >= identity_count).long()
+            heat_chunks.append(top_prob)
+            group_chunks.append(top_group)
+            token_chunks.append(top_token)
+
+        self.last_condition_attention = torch.cat(heat_chunks, dim=1).detach().cpu()
+        self.last_condition_attention_group = torch.cat(group_chunks, dim=1).detach().cpu()
+        self.last_condition_attention_top_token = torch.cat(token_chunks, dim=1).detach().cpu()
+
+    def _store_condition_attention(self, q_main, k_cond):
+        if self.cond_group_sizes is None:
+            return
+
+        identity_count = int(self.cond_group_sizes[0])
+        expression_count = int(self.cond_group_sizes[1]) if len(self.cond_group_sizes) > 1 else 0
+
+        if getattr(self, "capture_condition_winner_attention", False):
+            self._store_condition_winner_attention(
+                q_main,
+                k_cond,
+                identity_count,
+                expression_count,
+                int(getattr(self, "condition_attention_chunk_size", 512)),
+            )
 
     def _forward_with_condition(self, x, freqs):
         if not hasattr(self, "q_loras"):
@@ -203,6 +258,8 @@ class WanSelfAttention(nn.Module):
             v_cond = self.v(x_cond) + self.v_loras(x_cond)
             q_cond = rope_apply(q_cond, freqs_cond, self.num_heads)
             k_cond = rope_apply(k_cond, freqs_cond, self.num_heads)
+            
+            self._store_condition_attention(q_main, k_cond)
 
             self.kv_cache = {"k_cond": k_cond.detach(), "v_cond": v_cond.detach()}
             full_k = torch.concat([k_main, k_cond], dim=1)

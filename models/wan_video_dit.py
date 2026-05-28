@@ -273,7 +273,6 @@ class DiTBlock(nn.Module):
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
-
         if x_ip is not None:
             x_ip = self.gate(x_ip, gate_msa_ip, attn_out_ip)
             input_x_ip = modulate(self.norm2(x_ip), shift_mlp_ip, scale_mlp_ip)

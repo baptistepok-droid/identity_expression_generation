@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 
 from .condition_builder import DualConditionBuilder
-from .rope_utils import condition_freqs, video_freqs
+from .rope_utils import condition_freqs_from_geometry, video_freqs
 from .time_embedding import sinusoidal_embedding_1d
 
 
@@ -55,12 +55,13 @@ def model_fn_emotion_identity(
             sinusoidal_embedding_1d(dit.freq_dim, condition_time)
         )
         condition_time_mod = dit.time_projection(condition_time_emb).unflatten(1, (6, dit.dim))
-        cond_freqs = condition_freqs(
+        cond_freqs = condition_freqs_from_geometry(
             dit=dit,
             main_grid=grid,
-            condition_count=condition_tokens.shape[1],
             device=video_tokens.device,
-            condition_group_sizes=condition_token_counts,
+            identity_grid=condition.identity_grid,
+            expression_grid=condition.expression_grid,
+            expression_token_indices=condition.expression_token_indices,
         )
         freqs = torch.cat([freqs, cond_freqs], dim=0)
 

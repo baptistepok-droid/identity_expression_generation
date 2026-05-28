@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
+
+
+@dataclass
+class ExpressionAdapterOutput:
+    tokens: torch.Tensor
+    token_indices: torch.Tensor
 
 
 class ExpressionAdapter(nn.Module):
@@ -40,8 +48,27 @@ class ExpressionAdapter(nn.Module):
     ) -> torch.Tensor:
         """Return selected expression tokens with shape `[B, K, D]`."""
 
+        return self.select_tokens_with_indices(
+            expression_vae_tokens,
+            grid=grid,
+            face_boxes=face_boxes,
+        ).tokens
+
+    def select_tokens_with_indices(
+        self,
+        expression_vae_tokens: torch.Tensor,
+        grid: tuple[int, int, int],
+        face_boxes: torch.Tensor | None = None,
+    ) -> ExpressionAdapterOutput:
+        """Return selected expression tokens and their flattened grid indices."""
+
         if face_boxes is None:
-            return expression_vae_tokens
+            token_count = expression_vae_tokens.shape[1]
+            selected_ids = torch.arange(
+                token_count,
+                device=expression_vae_tokens.device,
+            ).unsqueeze(0).expand(expression_vae_tokens.shape[0], token_count)
+            return ExpressionAdapterOutput(expression_vae_tokens, selected_ids)
 
         selected_ids = self.face_token_indices(
             batch_size=expression_vae_tokens.shape[0],
@@ -51,7 +78,7 @@ class ExpressionAdapter(nn.Module):
         )
         gather_ids = selected_ids.unsqueeze(-1).expand(-1, -1, expression_vae_tokens.shape[-1])
         selected_tokens = expression_vae_tokens.gather(dim=1, index=gather_ids)
-        return selected_tokens
+        return ExpressionAdapterOutput(selected_tokens, selected_ids)
 
     def face_token_indices(
         self,
@@ -109,6 +136,8 @@ class ExpressionAdapter(nn.Module):
             return box.view(1, 1, 4).expand(batch_size, frames, 4)
 
         face_boxes = face_boxes.to(device=device, dtype=torch.float32)
+        if face_boxes.dim() == 1 and face_boxes.shape[0] == 4:
+            face_boxes = face_boxes.view(1, 1, 4)
         if face_boxes.dim() == 2:
             if face_boxes.shape[0] == batch_size:
                 face_boxes = face_boxes[:, None, :]

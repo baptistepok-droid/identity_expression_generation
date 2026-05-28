@@ -6,4 +6,7 @@ checkpoint*/
 *.pt
 *.pth
 *.safetensors
-
+*.mp4
+*.csv
+*.pyc
+*.log

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TOKENIZERS_PARALLELISM=false torchrun --nproc_per_node=4 train.py \
-  --dataset_base_path /home/ens.old/Bpokrzywa/datasets/dataset/MEAD \
+  --dataset_base_path /home/ens.old/Bpokrzywa/datasets/MEAD_full/MEAD \
   --dataset_metadata_path datasets/mead_identity_smoke.csv \
   --wan_model_path checkpoints/Wan2.1/t2v \
   --num_frames 81 \
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -81,22 +82,37 @@ def unwrap_fsdp_module(module: nn.Module) -> nn.Module:
 
 
 @contextmanager
-def summon_full_params_if_fsdp(module: nn.Module, writeback: bool = False):
+def summon_full_params_if_fsdp(
+    module: nn.Module,
+    writeback: bool = False,
+    rank0_only: bool = False,
+    offload_to_cpu: bool = False,
+):
     if hasattr(module, "_fsdp_wrapped_module"):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        with FSDP.summon_full_params(module, writeback=writeback, recurse=False):
+        with FSDP.summon_full_params(
+            module,
+            writeback=writeback,
+            recurse=False,
+            rank0_only=rank0_only,
+            offload_to_cpu=offload_to_cpu,
+        ):
             yield
     else:
         yield
 
 
-def init_condition_loras(dit: nn.Module, train: bool, rank: int) -> list[str]:
+def init_condition_loras(dit: nn.Module, train: bool, rank: int, train_last_blocks: int = 0) -> list[str]:
     initialized = []
+    total_blocks = len(dit.blocks)
+    train_start = max(0, total_blocks - train_last_blocks) if train_last_blocks > 0 else 0
+    setattr(dit, "condition_lora_train_start", train_start)
     for block_idx, block in enumerate(dit.blocks):
         block = unwrap_fsdp_module(block)
         attn = block.self_attn
-        attn.init_lora(train=train, rank=rank)
+        train_block = train and block_idx >= train_start
+        attn.init_lora(train=train_block, rank=rank)
         for name in CONDITION_LORA_NAMES:
             initialized.append(f"blocks.{block_idx}.self_attn.{name}")
     if not initialized:
@@ -112,15 +128,39 @@ def condition_lora_parameters(dit: nn.Module) -> list[nn.Parameter]:
         for name in CONDITION_LORA_NAMES:
             if not hasattr(attn, name):
                 continue
-            params.extend(getattr(attn, name).parameters())
+            params.extend(param for param in getattr(attn, name).parameters() if param.requires_grad)
     return params
 
 
-def export_condition_lora_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
+def export_lora_linear_weight(
+    linear: nn.Module,
+    accelerator: Accelerator | None = None,
+    rank0_only: bool = False,
+) -> torch.Tensor | None:
+    with summon_full_params_if_fsdp(
+        linear,
+        rank0_only=rank0_only,
+        offload_to_cpu=rank0_only,
+    ):
+        if rank0_only and accelerator is not None and not accelerator.is_main_process:
+            return None
+        unwrapped = unwrap_fsdp_module(linear)
+        return unwrapped.weight.detach().cpu().clone()
+
+
+def export_condition_lora_state_dict(
+    module: nn.Module,
+    accelerator: Accelerator | None = None,
+    rank0_only: bool = False,
+) -> dict[str, torch.Tensor]:
     state = {}
     if hasattr(module, "blocks"):
         for block_idx, block in enumerate(module.blocks):
-            with summon_full_params_if_fsdp(block):
+            with summon_full_params_if_fsdp(
+                block,
+                rank0_only=rank0_only,
+                offload_to_cpu=rank0_only,
+            ):
                 block = unwrap_fsdp_module(block)
                 attn = block.self_attn
                 for lora_name in CONDITION_LORA_NAMES:
@@ -128,13 +168,21 @@ def export_condition_lora_state_dict(module: nn.Module) -> dict[str, torch.Tenso
                         continue
                     submodule = getattr(attn, lora_name)
                     prefix = f"blocks.{block_idx}.self_attn.{lora_name}"
-                    state[f"{prefix}.down.weight"] = submodule.down.weight.detach().cpu()
-                    state[f"{prefix}.up.weight"] = submodule.up.weight.detach().cpu()
+                    down_weight = export_lora_linear_weight(submodule.down, accelerator, rank0_only)
+                    up_weight = export_lora_linear_weight(submodule.up, accelerator, rank0_only)
+                    if down_weight is not None:
+                        state[f"{prefix}.down.weight"] = down_weight
+                    if up_weight is not None:
+                        state[f"{prefix}.up.weight"] = up_weight
         return state
     for name, submodule in module.named_modules():
         if name.rsplit(".", 1)[-1] in CONDITION_LORA_NAMES:
-            state[f"{name}.down.weight"] = submodule.down.weight.detach().cpu()
-            state[f"{name}.up.weight"] = submodule.up.weight.detach().cpu()
+            down_weight = export_lora_linear_weight(submodule.down, accelerator, rank0_only)
+            up_weight = export_lora_linear_weight(submodule.up, accelerator, rank0_only)
+            if down_weight is not None:
+                state[f"{name}.down.weight"] = down_weight
+            if up_weight is not None:
+                state[f"{name}.up.weight"] = up_weight
     return state
 
 
@@ -172,10 +220,14 @@ def load_condition_lora_state_dict(module: nn.Module, state: dict[str, torch.Ten
 
 
 def save_lora(path: Path, module: nn.Module, metadata: dict[str, str], accelerator) -> None:
+    state = export_condition_lora_state_dict(module, accelerator=accelerator, rank0_only=True)
     if not accelerator.is_main_process:
         return
+    write_lora_state(path, state, metadata)
+
+
+def write_lora_state(path: Path, state: dict[str, torch.Tensor], metadata: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    state = export_condition_lora_state_dict(module)
     if path.suffix == ".safetensors":
         from safetensors.torch import save_file
 
@@ -190,6 +242,9 @@ class TrainSample:
     prompt: str
     identity_image: Image.Image | None = None
     expression_video: list[Image.Image] | None = None
+    video_path: str | None = None
+    identity_image_path: str | None = None
+    expression_video_path: str | None = None
 
 
 class WanVideoTrainingDataset(Dataset):
@@ -227,15 +282,21 @@ class WanVideoTrainingDataset(Dataset):
         video_key = row.get("video") or row.get("video_path")
         if not video_key:
             raise ValueError("Each metadata row must contain video or video_path.")
+        video_path = self.resolve(video_key)
+        identity_path = self.resolve(row["identity_image"]) if row.get("identity_image") else None
+        expression_path = self.resolve(row["expression_video"]) if row.get("expression_video") else None
         return TrainSample(
-            video=self.load_media(self.resolve(video_key), self.num_frames),
+            video=self.load_media(video_path, self.num_frames),
             prompt=row.get("prompt", ""),
-            identity_image=self.load_image(self.resolve(row["identity_image"])) if row.get("identity_image") else None,
+            identity_image=self.load_image(identity_path) if identity_path is not None else None,
             expression_video=(
-                self.load_media(self.resolve(row["expression_video"]), self.expression_frames)
-                if row.get("expression_video")
+                self.load_media(expression_path, self.expression_frames)
+                if expression_path is not None
                 else None
             ),
+            video_path=str(video_path),
+            identity_image_path=str(identity_path) if identity_path is not None else None,
+            expression_video_path=str(expression_path) if expression_path is not None else None,
         )
 
     def resolve(self, value: str) -> Path:
@@ -376,11 +437,83 @@ class WanConditionLoRATrainingModule(nn.Module):
         self.pipe.dit.requires_grad_(False)
         self.pipe.text_encoder.requires_grad_(False)
         self.pipe.vae.requires_grad_(False)
-        self.condition_loras = init_condition_loras(self.pipe.dit, train=True, rank=args.rank)
+        self.condition_loras = init_condition_loras(
+            self.pipe.dit,
+            train=True,
+            rank=args.rank,
+            train_last_blocks=args.train_condition_lora_last_blocks,
+        )
         self.condition_lora_param_count = sum(param.numel() for param in condition_lora_parameters(self.pipe.dit))
         self.pipe.dit.train()
         self.pipe.text_encoder.eval()
         self.pipe.vae.eval()
+
+    def preprocess_cache_path(self, sample: TrainSample, height: int, width: int) -> Path | None:
+        if not self.args.preprocess_cache_dir:
+            return None
+        payload = {
+            "version": 1,
+            "video_path": sample.video_path,
+            "identity_image_path": sample.identity_image_path,
+            "expression_video_path": sample.expression_video_path,
+            "prompt": sample.prompt,
+            "height": height,
+            "width": width,
+            "num_frames": self.args.num_frames,
+            "expression_frames": self.args.expression_frames,
+            "detect_expression_boxes": self.args.detect_expression_boxes,
+            "tiled": self.args.tiled,
+            "tile_size": self.args.tile_size,
+            "tile_stride": self.args.tile_stride,
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return Path(self.args.preprocess_cache_dir) / f"{digest}.pt"
+
+    def load_preprocess_cache(self, path: Path | None) -> dict | None:
+        if path is None or not path.exists():
+            return None
+        try:
+            cached = torch.load(path, map_location="cpu")
+        except Exception as exc:
+            print(f"Warning: ignoring unreadable preprocess cache {path}: {exc}")
+            return None
+        required = ("context", "input_latents")
+        if not isinstance(cached, dict) or any(key not in cached for key in required):
+            print(f"Warning: ignoring incomplete preprocess cache {path}")
+            return None
+        return cached
+
+    def save_preprocess_cache(
+        self,
+        path: Path | None,
+        context: torch.Tensor,
+        input_latents: torch.Tensor,
+        identity_latents: torch.Tensor | None,
+        expression_latents: torch.Tensor | None,
+        expression_face_boxes,
+    ) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if expression_face_boxes is not None and not isinstance(expression_face_boxes, torch.Tensor):
+            expression_face_boxes = torch.tensor(expression_face_boxes)
+        payload = {
+            "context": context.detach().cpu(),
+            "input_latents": input_latents.detach().cpu(),
+            "identity_latents": identity_latents.detach().cpu() if identity_latents is not None else None,
+            "expression_latents": expression_latents.detach().cpu() if expression_latents is not None else None,
+            "expression_face_boxes": expression_face_boxes.detach().cpu() if expression_face_boxes is not None else None,
+        }
+        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+
+    def cached_tensor_to_device(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        return tensor.to(device=self.pipe.device, dtype=self.pipe.torch_dtype)
 
     def forward(self, sample: TrainSample) -> torch.Tensor:
         if sample is None:
@@ -402,45 +535,67 @@ class WanConditionLoRATrainingModule(nn.Module):
 
     def forward_preprocess(self, sample: TrainSample) -> dict:
         height, width = sample.video[0].height, sample.video[0].width
-        with torch.no_grad():
-            if self.args.fsdp_shard_dit:
-                self.pipe.text_encoder.to(self.pipe.device)
-                self.pipe.vae.to(self.pipe.device)
-            else:
-                self.pipe.load_models_to_device(["text_encoder", "vae"])
-            context = self.pipe.prompter.encode_prompt(
-                sample.prompt,
-                positive=True,
-                device=self.pipe.device,
-            )
-            video = self.pipe.preprocess_video(sample.video)
-            input_latents = self.pipe.vae.encode(
-                video,
-                device=self.pipe.device,
-                tiled=self.args.tiled,
-                tile_size=(self.args.tile_size, self.args.tile_size),
-                tile_stride=(self.args.tile_stride, self.args.tile_stride),
-            ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-            noise = torch.randn_like(input_latents)
+        cache_path = self.preprocess_cache_path(sample, height, width)
+        cached = self.load_preprocess_cache(cache_path)
+        if cached is not None:
+            context = self.cached_tensor_to_device(cached["context"])
+            input_latents = self.cached_tensor_to_device(cached["input_latents"])
+            identity_latents = self.cached_tensor_to_device(cached.get("identity_latents"))
+            expression_latents = self.cached_tensor_to_device(cached.get("expression_latents"))
+            expression_face_boxes = cached.get("expression_face_boxes")
+        else:
+            with torch.no_grad():
+                if self.args.fsdp_shard_dit:
+                    self.pipe.text_encoder.to(self.pipe.device)
+                    self.pipe.vae.to(self.pipe.device)
+                else:
+                    self.pipe.load_models_to_device(["text_encoder", "vae"])
+                context = self.pipe.prompter.encode_prompt(
+                    sample.prompt,
+                    positive=True,
+                    device=self.pipe.device,
+                )
+                video = self.pipe.preprocess_video(sample.video)
+                input_latents = self.pipe.vae.encode(
+                    video,
+                    device=self.pipe.device,
+                    tiled=self.args.tiled,
+                    tile_size=(self.args.tile_size, self.args.tile_size),
+                    tile_stride=(self.args.tile_stride, self.args.tile_stride),
+                ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
 
-            identity_latents = None
-            if sample.identity_image is not None:
-                identity_latents = self.pipe.encode_ip_image(sample.identity_image)
+                identity_latents = None
+                if sample.identity_image is not None:
+                    identity_latents = self.pipe.encode_identity_image(
+                        sample.identity_image,
+                        height,
+                        width,
+                    )
 
-            expression_latents = None
-            expression_face_boxes = None
-            if sample.expression_video is not None:
-                expression_latents = self.pipe.encode_condition_frames(sample.expression_video, height, width)
-                if self.args.detect_expression_boxes:
-                    expression_face_boxes = self.pipe.detect_expression_face_boxes(sample.expression_video)
-            if self.args.fsdp_shard_dit:
-                self.pipe.text_encoder.cpu()
-                self.pipe.vae.cpu()
-                torch.cuda.empty_cache()
+                expression_latents = None
+                expression_face_boxes = None
+                if sample.expression_video is not None:
+                    expression_latents = self.pipe.encode_condition_frames(sample.expression_video, height, width)
+                    if self.args.detect_expression_boxes:
+                        expression_face_boxes = self.pipe.detect_expression_face_boxes(sample.expression_video)
+                self.save_preprocess_cache(
+                    cache_path,
+                    context,
+                    input_latents,
+                    identity_latents,
+                    expression_latents,
+                    expression_face_boxes,
+                )
+                if self.args.fsdp_shard_dit:
+                    self.pipe.text_encoder.cpu()
+                    self.pipe.vae.cpu()
+                    torch.cuda.empty_cache()
+        noise = torch.randn_like(input_latents)
 
         condition_builder = None
         if identity_latents is not None or expression_latents is not None:
             condition_builder = self.pipe.get_condition_builder(self.pipe.dit)
+            condition_builder.expression_adapter.max_expression_tokens = self.args.max_expression_tokens
             condition_builder.requires_grad_(False)
 
         else:
@@ -481,12 +636,16 @@ def save_training_state(
     args: argparse.Namespace,
 ) -> None:
     accelerator.wait_for_everyone()
+    unwrapped = accelerator.unwrap_model(model)
+    lora_state = export_condition_lora_state_dict(
+        unwrapped.pipe.dit,
+        accelerator=accelerator,
+        rank0_only=True,
+    )
     if not accelerator.is_main_process:
         return
-    unwrapped = accelerator.unwrap_model(model)
     checkpoint_dir = output_dir / f"checkpoint-{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    lora_state = export_condition_lora_state_dict(unwrapped.pipe.dit)
     torch.save(
         {
             "step": step,
@@ -497,16 +656,15 @@ def save_training_state(
         },
         checkpoint_dir / "training_state.pt",
     )
-    save_lora(
+    write_lora_state(
         output_dir / f"standin_condition_lora_step_{step:06d}{args.output_suffix}",
-        unwrapped.pipe.dit,
+        lora_state,
         {
             "base": "WanVideo",
             "targets": ",".join(CONDITION_LORA_NAMES),
             "rank": str(args.rank),
             "standin_condition_lora": "true",
         },
-        accelerator,
     )
 
 
@@ -813,11 +971,15 @@ def train(args: argparse.Namespace) -> None:
         file=sys.stdout,
     )
     accumulation_step = 0
+    loss_sum_for_log = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+    loss_count_for_log = torch.zeros((), device=accelerator.device, dtype=torch.float32)
     while global_step < args.max_steps:
         for sample in dataloader:
             profile_memory = global_step == 0 and accelerator.is_local_main_process
             if accumulation_step == 0:
                 optimizer.zero_grad(set_to_none=True)
+                loss_sum_for_log.zero_()
+                loss_count_for_log.zero_()
             if profile_memory:
                 torch.cuda.reset_peak_memory_stats(accelerator.device)
                 print_cuda_memory("step0 before forward", accelerator)
@@ -826,7 +988,9 @@ def train(args: argparse.Namespace) -> None:
             except torch.OutOfMemoryError:
                 dump_cuda_oom_debug(output_dir, accelerator, "oom_forward")
                 raise
-            loss_for_log = loss.detach()
+            loss_for_log = loss.detach().float()
+            loss_sum_for_log += loss_for_log
+            loss_count_for_log += 1
             if profile_memory:
                 print_cuda_memory("step0 after forward", accelerator)
                 torch.cuda.empty_cache()
@@ -851,8 +1015,11 @@ def train(args: argparse.Namespace) -> None:
 
                 global_step += 1
                 progress.update(1)
+                gathered_loss_sum = accelerator.gather(loss_sum_for_log.detach()).sum()
+                gathered_loss_count = accelerator.gather(loss_count_for_log.detach()).sum().clamp_min(1)
+                mean_loss_for_log = (gathered_loss_sum / gathered_loss_count).item()
                 progress.set_postfix(
-                    loss=f"{accelerator.gather(loss_for_log).mean().item():.5f}",
+                    loss=f"{mean_loss_for_log:.5f}",
                     lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
                 )
                 progress.refresh()
@@ -888,10 +1055,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--expression_frames", type=int, default=65)
     parser.add_argument("--dataset_repeat", type=int, default=1)
+    parser.add_argument("--preprocess_cache_dir", default=None, help="Optional directory for cached prompt/VAE latents/face boxes.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size per process/GPU.")
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--rank", type=int, default=128)
+    parser.add_argument("--train_condition_lora_last_blocks", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=128.0, help="Deprecated; condition LoRA follows Stand-In and does not use alpha scaling.")
     parser.add_argument("--dropout", type=float, default=0.0, help="Deprecated; condition LoRA follows Stand-In and does not use dropout.")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -914,6 +1083,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tiled", action="store_true")
     parser.add_argument("--use_vace", action="store_true")
     parser.add_argument("--detect_expression_boxes", action="store_true")
+    parser.add_argument("--max_expression_tokens", type=int, default=8192)
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--gradient_checkpointing_offload", action="store_true")
     parser.add_argument("--fsdp_shard_dit", action="store_true", help="Experimentally shard Wan DiT blocks with PyTorch FSDP.")

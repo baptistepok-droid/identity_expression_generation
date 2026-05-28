@@ -1,4 +1,5 @@
 import torch, types
+import time
 import numpy as np
 from PIL import Image
 from einops import repeat
@@ -14,8 +15,9 @@ from typing import List, Tuple
 import PIL
 from utils import BasePipeline, ModelConfig, PipelineUnit, PipelineUnitRunner
 from models import DualConditionBuilder, ModelManager, load_state_dict
-from models.rope_utils import condition_freqs
+from models.rope_utils import condition_freqs_from_geometry
 from models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
+from models.attention import RMSNorm as AttentionRMSNorm
 from models.wan_video_text_encoder import (
     WanTextEncoder,
     T5RelativeEmbedding,
@@ -34,6 +36,15 @@ from vram_management import (
     WanAutoCastLayerNorm,
 )
 from lora import GeneralLoRALoader
+
+
+_WAN_DEBUG_START = time.perf_counter()
+
+
+def wan_debug(message):
+    elapsed = time.perf_counter() - _WAN_DEBUG_START
+    print(f"[wan-debug +{elapsed:8.1f}s] {message}", flush=True)
+
 
 def load_video_as_list(video_path: str) -> Tuple[List[Image.Image], int, int, int]:
     if not os.path.isfile(video_path):
@@ -129,17 +140,19 @@ class WanVideoPipeline(BasePipeline):
             setattr(self, attr_name, builder)
         return builder
 
-    def encode_ip_image(self, ip_image):
+    def encode_identity_image(self, image, height=None, width=None):
         self.load_models_to_device(["vae"])
-        ip_image = (
-            torch.tensor(np.array(ip_image)).permute(2, 0, 1).float() / 255.0
+        if height is not None and width is not None:
+            image = image.resize((width, height))
+        image = (
+            torch.tensor(np.array(image)).permute(2, 0, 1).float() / 255.0
         )  # [3, H, W]
-        ip_image = (
-            ip_image.unsqueeze(1).unsqueeze(0).to(dtype=self.torch_dtype)
+        image = (
+            image.unsqueeze(1).unsqueeze(0).to(dtype=self.torch_dtype)
         )  # [B, 3, 1, H, W]
-        ip_image = ip_image * 2 - 1
-        ip_image_latent = self.vae.encode(ip_image, device=self.device, tiled=False)
-        return ip_image_latent
+        image = image * 2 - 1
+        image_latents = self.vae.encode(image, device=self.device, tiled=False)
+        return image_latents
 
     def encode_condition_frames(self, frames, height, width):
         self.load_models_to_device(["vae"])
@@ -153,16 +166,22 @@ class WanVideoPipeline(BasePipeline):
         if isinstance(frames, Image.Image):
             frames = [frames]
         if self.face_box_detection_failed:
+            wan_debug("Skipping expression face detection because it failed earlier")
             return None
         if self.face_box_detector is None:
             try:
+                wan_debug("Initializing InsightFace detector for expression boxes")
                 self.face_box_detector = InsightFaceBoxDetector()
+                wan_debug("InsightFace detector ready")
             except ImportError as exc:
                 print(f"Warning: automatic face detection disabled: {exc}")
                 self.face_box_detection_failed = True
                 return None
         try:
-            return self.face_box_detector.detect_frames(frames)
+            wan_debug(f"Detecting expression face boxes on {len(frames)} frames")
+            boxes = self.face_box_detector.detect_frames(frames)
+            wan_debug(f"Detected expression face boxes with shape={tuple(boxes.shape)}")
+            return boxes
         except ValueError as exc:
             print(f"Warning: automatic face detection failed: {exc}")
             return None
@@ -237,6 +256,7 @@ class WanVideoPipeline(BasePipeline):
                     torch.nn.Conv3d: AutoWrappedModule,
                     torch.nn.LayerNorm: WanAutoCastLayerNorm,
                     RMSNorm: AutoWrappedModule,
+                    AttentionRMSNorm: AutoWrappedModule,
                     torch.nn.Conv2d: AutoWrappedModule,
                 },
                 module_config=dict(
@@ -268,6 +288,7 @@ class WanVideoPipeline(BasePipeline):
                     torch.nn.Conv3d: AutoWrappedModule,
                     torch.nn.LayerNorm: WanAutoCastLayerNorm,
                     RMSNorm: AutoWrappedModule,
+                    AttentionRMSNorm: AutoWrappedModule,
                     torch.nn.Conv2d: AutoWrappedModule,
                 },
                 module_config=dict(
@@ -543,34 +564,43 @@ class WanVideoPipeline(BasePipeline):
         tea_cache_model_id: Optional[str] = "",
         # progress_bar
         progress_bar_cmd=tqdm,
-        # Stand-In
-        ip_image=None,
         # Experimental identity/expression condition branch
         identity_reference_image=None,
         expression_reference_frames=None,
         expression_face_boxes=None,
     ):
-        if ip_image is not None:
-            ip_image = self.encode_ip_image(ip_image)
         identity_latents = None
         expression_latents = None
         if identity_reference_image is not None:
-            identity_latents = self.encode_ip_image(identity_reference_image)
+            wan_debug("Encoding identity reference image")
+            identity_latents = self.encode_identity_image(
+                identity_reference_image,
+                height=height,
+                width=width,
+            )
+            wan_debug(f"Encoded identity latents shape={tuple(identity_latents.shape)}")
         if expression_reference_frames is not None:
             if expression_face_boxes is None:
+                wan_debug("No expression face boxes supplied; starting automatic detection")
                 expression_face_boxes = self.detect_expression_face_boxes(
                     expression_reference_frames
                 )
+            else:
+                wan_debug("Using supplied expression face boxes")
+            wan_debug(f"Encoding expression reference frames count={len(expression_reference_frames)}")
             expression_latents = self.encode_condition_frames(
                 expression_reference_frames,
                 height=height,
                 width=width,
             )
+            wan_debug(f"Encoded expression latents shape={tuple(expression_latents.shape)}")
         if expression_face_boxes is not None and not isinstance(
             expression_face_boxes, torch.Tensor
         ):
             expression_face_boxes = torch.tensor(expression_face_boxes)
+            wan_debug(f"Converted expression face boxes to tensor shape={tuple(expression_face_boxes.shape)}")
         # Scheduler
+        wan_debug(f"Setting scheduler timesteps num_inference_steps={num_inference_steps}")
         self.scheduler.set_timesteps(
             num_inference_steps,
             denoising_strength=denoising_strength,
@@ -614,19 +644,22 @@ class WanVideoPipeline(BasePipeline):
             "tile_stride": tile_stride,
             "sliding_window_size": sliding_window_size,
             "sliding_window_stride": sliding_window_stride,
-            "ip_image": ip_image,
             "condition_builder": None,
             "identity_latents": identity_latents,
             "expression_latents": expression_latents,
             "expression_face_boxes": expression_face_boxes,
         }
         for unit in self.units:
+            wan_debug(f"Running pipeline unit {unit.__class__.__name__}")
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(
                 unit, self, inputs_shared, inputs_posi, inputs_nega
             )
+            wan_debug(f"Finished pipeline unit {unit.__class__.__name__}")
         # Denoise
+        wan_debug(f"Loading iteration models to device: {self.in_iteration_models}")
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
+        wan_debug(f"Starting denoise loop with {len(self.scheduler.timesteps)} timesteps")
         for progress_id, timestep in enumerate(
             progress_bar_cmd(self.scheduler.timesteps)
         ):
@@ -639,7 +672,6 @@ class WanVideoPipeline(BasePipeline):
             ):
                 self.load_models_to_device(self.in_iteration_models_2)
                 models["dit"] = self.dit2
-                inputs_shared["ip_image"] = ip_image
 
             # Timestep
             timestep = timestep.unsqueeze(0).to(
@@ -654,14 +686,26 @@ class WanVideoPipeline(BasePipeline):
             noise_pred_posi = self.model_fn(
                 **models, **inputs_shared, **inputs_posi, timestep=timestep
             )
-            inputs_shared["ip_image"] = None
             if cfg_scale != 1.0:
                 if cfg_merge:
                     noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
                 else:
-                    noise_pred_nega = self.model_fn(
-                        **models, **inputs_shared, **inputs_nega, timestep=timestep
-                    )
+                    condition_inputs = {
+                        "condition_builder": inputs_shared.get("condition_builder"),
+                        "identity_latents": inputs_shared.get("identity_latents"),
+                        "expression_latents": inputs_shared.get("expression_latents"),
+                        "expression_face_boxes": inputs_shared.get("expression_face_boxes"),
+                    }
+                    inputs_shared["condition_builder"] = None
+                    inputs_shared["identity_latents"] = None
+                    inputs_shared["expression_latents"] = None
+                    inputs_shared["expression_face_boxes"] = None
+                    try:
+                        noise_pred_nega = self.model_fn(
+                            **models, **inputs_shared, **inputs_nega, timestep=timestep
+                        )
+                    finally:
+                        inputs_shared.update(condition_inputs)
                 noise_pred = noise_pred_nega + cfg_scale * (
                     noise_pred_posi - noise_pred_nega
                 )
@@ -680,7 +724,9 @@ class WanVideoPipeline(BasePipeline):
                 ]
 
         # Decode
+        wan_debug("Denoise loop done; loading VAE for decode")
         self.load_models_to_device(["vae"])
+        wan_debug("Decoding latents to video")
         video = self.vae.decode(
             inputs_shared["latents"],
             device=self.device,
@@ -689,6 +735,7 @@ class WanVideoPipeline(BasePipeline):
             tile_stride=tile_stride,
         )
         video = self.vae_output_to_video(video)
+        wan_debug(f"Decoded video frames={len(video)}")
         self.load_models_to_device([])
 
         return video
@@ -1464,7 +1511,6 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input=None,
     fuse_vae_embedding_in_latents: bool = False,
-    ip_image=None,
     condition_builder: Optional[DualConditionBuilder] = None,
     identity_latents: Optional[torch.Tensor] = None,
     expression_latents: Optional[torch.Tensor] = None,
@@ -1510,7 +1556,6 @@ def model_fn_wan_video(
     x_ip = None
     t_mod_ip = None
     condition_token_counts = None
-    ip_token_count = 0
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
         timestep = torch.concat(
@@ -1535,11 +1580,6 @@ def model_fn_wan_video(
     else:
         t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
         t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
-
-    if ip_image is not None:
-        timestep_ip = torch.zeros_like(timestep)  # [B] with 0s
-        t_ip = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep_ip))
-        t_mod_ip = dit.time_projection(t_ip).unflatten(1, (6, dit.dim))
 
     # Motion Controller
     if motion_bucket_id is not None and motion_controller is not None:
@@ -1586,29 +1626,6 @@ def model_fn_wan_video(
     )
 
     ############################################################################################
-    if ip_image is not None:
-        x_ip, (f_ip, h_ip, w_ip) = dit.patchify(
-            ip_image
-        )  # x_ip [1, 1024, 5120] [B, N, D]   f_ip = 1  h_ip = 32  w_ip = 32
-        freqs_ip = (
-            torch.cat(
-                [
-                    dit.freqs[0][0].view(f_ip, 1, 1, -1).expand(f_ip, h_ip, w_ip, -1),
-                    dit.freqs[1][h + offset : h + offset + h_ip]
-                    .view(1, h_ip, 1, -1)
-                    .expand(f_ip, h_ip, w_ip, -1),
-                    dit.freqs[2][w + offset : w + offset + w_ip]
-                    .view(1, 1, w_ip, -1)
-                    .expand(f_ip, h_ip, w_ip, -1),
-                ],
-                dim=-1,
-            )
-            .reshape(f_ip * h_ip * w_ip, 1, -1)
-            .to(x_ip.device)
-        )
-        freqs = torch.cat([freqs, freqs_ip], dim=0)
-        ip_token_count = x_ip.shape[1]
-
     if condition_builder is not None and (
         identity_latents is not None or expression_latents is not None
     ):
@@ -1620,10 +1637,6 @@ def model_fn_wan_video(
         if condition is not None:
             condition_tokens = condition.tokens.to(dtype=x.dtype, device=x.device)
             condition_token_counts = (
-                ip_token_count + condition.identity_token_count,
-                condition.expression_token_count,
-            )
-            condition_freq_group_sizes = (
                 condition.identity_token_count,
                 condition.expression_token_count,
             )
@@ -1632,19 +1645,43 @@ def model_fn_wan_video(
                 sinusoidal_embedding_1d(dit.freq_dim, condition_time)
             )
             t_mod_ip = dit.time_projection(condition_time_emb).unflatten(1, (6, dit.dim))
-            condition_freq = condition_freqs(
+            condition_freq = condition_freqs_from_geometry(
                 dit=dit,
                 main_grid=(f, h, w),
-                condition_count=condition_tokens.shape[1],
                 device=x.device,
-                condition_group_sizes=condition_freq_group_sizes,
+                identity_grid=condition.identity_grid,
+                expression_grid=condition.expression_grid,
+                expression_token_indices=condition.expression_token_indices,
             )
-            x_ip = (
-                condition_tokens
-                if x_ip is None
-                else torch.cat([x_ip, condition_tokens], dim=1)
-            )
+            x_ip = condition_tokens
             freqs = torch.cat([freqs, condition_freq], dim=0)
+    if dit.training and not getattr(dit, "_printed_condition_token_debug", False):
+        should_print = True
+        try:
+            import torch.distributed as dist
+
+            should_print = not dist.is_initialized() or dist.get_rank() == 0
+        except Exception:
+            should_print = True
+        if should_print:
+            identity_tokens = 0
+            expression_tokens = 0
+            if condition_token_counts is not None:
+                identity_tokens, expression_tokens = condition_token_counts
+            condition_total = identity_tokens + expression_tokens
+            print(
+                "[token-debug] "
+                f"main_video_tokens={x.shape[1]} "
+                f"latent_grid=({f},{h},{w}) "
+                f"text_tokens={context.shape[1]} "
+                f"identity_tokens={identity_tokens} "
+                f"expression_tokens={expression_tokens} "
+                f"condition_total={condition_total} "
+                f"condition_tokens_total={0 if x_ip is None else x_ip.shape[1]} "
+                f"freqs_total={freqs.shape[0]}",
+                flush=True,
+            )
+        dit._printed_condition_token_debug = True
     ############################################################################################
     # TeaCache
     if tea_cache is not None:
@@ -1668,20 +1705,38 @@ def model_fn_wan_video(
 
             return custom_forward
 
-        for block in dit.blocks:
+        train_start = getattr(dit, "condition_lora_train_start", 0)
+        for block_idx, block in enumerate(dit.blocks):
+            skip_grad = dit.training and train_start > 0 and block_idx < train_start
+            if skip_grad:
+                with torch.no_grad():
+                    x, x_ip = block(
+                        x,
+                        context,
+                        t_mod,
+                        freqs,
+                        x_ip=x_ip,
+                        t_mod_ip=t_mod_ip,
+                        condition_token_counts=condition_token_counts,
+                    )
+                continue
+            if dit.training and train_start > 0 and block_idx == train_start:
+                x = x.detach()
+                if x_ip is not None:
+                    x_ip = x_ip.detach()
             if use_gradient_checkpointing_offload:
                 with torch.autograd.graph.save_on_cpu():
                     x, x_ip = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
-                    x,
-                    context,
-                    t_mod,
-                    freqs,
-                    x_ip,
-                    t_mod_ip,
-                    condition_token_counts,
-                    use_reentrant=False,
-                )
+                        x,
+                        context,
+                        t_mod,
+                        freqs,
+                        x_ip,
+                        t_mod_ip,
+                        condition_token_counts,
+                        use_reentrant=False,
+                    )
             elif use_gradient_checkpointing:
                 x, x_ip = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),

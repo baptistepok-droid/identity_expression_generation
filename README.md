@@ -34,9 +34,10 @@ expression_video
 
 They are then injected into the backbone DiT through restricted self-attention:
 video tokens can attend to the condition tokens, while the condition branch
-remains stable. Identity and expression groups also use distinct RoPE mappings
-through `models/rope_utils.py`, so they do not occupy the exact same conditional
-position space.
+remains stable. Identity and expression groups use geometry-aware RoPE mappings
+through `models/rope_utils.py`: identity and expression keep their spatial
+layouts at the same condition offset, while identity uses the static reference
+time and expression keeps the temporal layout of the selected video tokens.
 
 ## Active Pipeline
 
@@ -47,7 +48,7 @@ pipelines/wan_video.py
   -> WanVideoPipeline
   -> model_fn_wan_video
   -> DualConditionBuilder
-  -> condition_freqs
+  -> condition_freqs_from_geometry
   -> DiT blocks / restricted self-attention
 ```
 
@@ -71,4 +72,3 @@ expression_identity_gen/
     trainer.py
     losses.py
 ```
-
